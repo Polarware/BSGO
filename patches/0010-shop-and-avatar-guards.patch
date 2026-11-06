@@ -1,0 +1,399 @@
+diff --git a/src/main/java/io/github/luigeneric/core/player/container/visitors/ContainerVisitor.java b/src/main/java/io/github/luigeneric/core/player/container/visitors/ContainerVisitor.java
+index a46d26b..692fc75 100644
+--- a/src/main/java/io/github/luigeneric/core/player/container/visitors/ContainerVisitor.java
++++ b/src/main/java/io/github/luigeneric/core/player/container/visitors/ContainerVisitor.java
+@@ -10,6 +10,8 @@ import io.github.luigeneric.core.protocols.ProtocolID;
+ import io.github.luigeneric.core.protocols.ProtocolRegistryWriteOnly;
+ import io.github.luigeneric.core.protocols.debug.DebugProtocol;
+ import io.github.luigeneric.core.protocols.notification.NotificationProtocolWriteOnly;
++import io.github.luigeneric.core.protocols.player.CapitalRental;
++import io.github.luigeneric.templates.cards.ShipCard;
+ import io.github.luigeneric.core.protocols.player.PlayerProtocol;
+ import io.github.luigeneric.enums.GameLocation;
+ import io.github.luigeneric.enums.ResourceType;
+@@ -396,7 +398,16 @@ public abstract class ContainerVisitor
+         final ShopItemCard shopItemCard = optShopItemCard.get();
+ 
+ 
+-        final float cubitsPrice = shopItemCard.getUpgradePrice().getItems().get(ResourceType.Cubits.guid);
++        // The tuning-kit odds are packCount / (cubitsPrice / 1000), so a card whose UpgradePrice has
++        // no Cubits entry unboxes null here, and one that prices Cubits at 0 divides by zero: the
++        // chance comes out +Infinity, Mathf.min pins it to 1f, and rollChance(1f) always succeeds.
++        // That is a free guaranteed level-up for a single tuning kit, and this path never charges
++        // the UpgradePrice at all - only the kits. 136 of the 2 190 upgrade levels in the card dump
++        // carry Cubits at exactly 0, so it arms itself the moment UserUpgradeable systems ship.
++        // No price, no pack upgrade; the ordinary cubit upgrade path is unaffected.
++        final Float cubitsInPrice = shopItemCard.getUpgradePrice().getItems().get(ResourceType.Cubits.guid);
++        if (cubitsInPrice == null || cubitsInPrice <= 0f) return false;
++        final float cubitsPrice = cubitsInPrice;
+         final float chanceToUpgrade = Mathf.min(1f, packCount / (cubitsPrice / 1000f));
+ 
+         Optional<ShipItem> tuningKits = hold.getByGUID(ResourceType.TuningKit.guid);
+@@ -663,8 +674,28 @@ public abstract class ContainerVisitor
+             return false;
+         }
+ 
++        // Ships are stocked only so ShipQueue.UpdateShipCards can see them - it filters the ShipList
++        // by shop.GetByGUID. They are never buyable as inventory items; the real path is
++        // PlayerProtocol.addShip, which checks level and faction. Without this, a hand-crafted
++        // MoveItem shop->hold buys a StoreShip straight into cargo and skips both checks.
++        if (itemToBuy.getItemType() == ItemType.Ship) return false;
++
++        // A capital rental pass is a trigger, not an item: buying one starts the rental at the
++        // live CapitalRental discount price, and the pass itself is never delivered.
++        if (CapitalRental.isPass(itemToBuy.getCardGuid()))
++        {
++            final PlayerProtocol playerProtocol = user.getProtocol(ProtocolID.Player);
++            CDI.current().select(Catalogue.class).get()
++                    .fetchCard(CapitalRental.capitalForPass(itemToBuy.getCardGuid()), CardView.Ship)
++                    .ifPresent(card -> playerProtocol.rentCapital((ShipCard) card));
++            return false;
++        }
++
+         //check prices
+         final Price tmpPrice = optShopItemCard.get().getBuyPrice();
++        // An empty BuyPrice means NOT FOR SALE - isEnoughInContainer would otherwise loop over zero
++        // entries and return true, handing the item out for free.
++        if (tmpPrice.isEmpty()) return false;
+         boolean isEnoughInContainer = isEnoughInContainer(tmpPrice, buyContainer, buyCount);
+         if (!isEnoughInContainer) return false;
+         buyPrice.addPrice(tmpPrice);
+diff --git a/src/main/java/io/github/luigeneric/core/protocols/player/PlayerProtocol.java b/src/main/java/io/github/luigeneric/core/protocols/player/PlayerProtocol.java
+index 29669b4..45ff85f 100644
+--- a/src/main/java/io/github/luigeneric/core/protocols/player/PlayerProtocol.java
++++ b/src/main/java/io/github/luigeneric/core/protocols/player/PlayerProtocol.java
+@@ -3,6 +3,7 @@ package io.github.luigeneric.core.protocols.player;
+ import io.github.luigeneric.MicrometerRegistry;
+ import io.github.luigeneric.binaryreaderwriter.BgoProtocolReader;
+ import io.github.luigeneric.binaryreaderwriter.BgoProtocolWriter;
++import io.github.luigeneric.core.CapitalRentalRegistry;
+ import io.github.luigeneric.core.ProtocolContext;
+ import io.github.luigeneric.core.User;
+ import io.github.luigeneric.core.UsersContainer;
+@@ -16,6 +17,7 @@ import io.github.luigeneric.core.gameplayalgorithms.ExperienceToLevelAlgo;
+ import io.github.luigeneric.core.player.*;
+ import io.github.luigeneric.core.player.container.*;
+ import io.github.luigeneric.core.player.container.containerids.MailContainerID;
++import io.github.luigeneric.core.player.container.containerids.ShipSlotContainerID;
+ import io.github.luigeneric.core.player.container.visitors.*;
+ import io.github.luigeneric.core.player.counters.Mission;
+ import io.github.luigeneric.core.player.counters.MissionBook;
+@@ -57,6 +59,9 @@ import io.github.luigeneric.templates.shipitems.ShipItem;
+ import io.github.luigeneric.templates.shipitems.ShipSystem;
+ import io.github.luigeneric.templates.utils.ObjectStat;
+ import io.github.luigeneric.templates.utils.ObjectStats;
++import io.github.luigeneric.core.galaxy.Galaxy;
++import io.github.luigeneric.core.player.counters.CounterDesc;
++import io.github.luigeneric.enums.ResourceType;
+ import io.github.luigeneric.templates.utils.Price;
+ import jakarta.enterprise.inject.spi.CDI;
+ import lombok.extern.slf4j.Slf4j;
+@@ -218,6 +223,20 @@ public class PlayerProtocol extends BgoProtocol implements StatsProtocolSubscrib
+                     final AvatarDescription avatarDescription = br.readDesc(AvatarDescription.class);
+                     final Player player = this.user().getPlayer();
+ 
++                    // Everything below re-grants the starter resources and re-sends the hangar, so
++                    // replaying CreateAvatar from in-flight is a free-resource exploit as well as
++                    // a desync. Deliberately an ALLOW-list of the two character-creation
++                    // locations rather than a single == check: SetFaction switches to Avatar
++                    // (:161) and a mid-creation reconnect resumes into Starter or Avatar
++                    // (SqLiteProvider:539), and blocking a legitimate creation would be far worse
++                    // than the exploit. Every actual play location is rejected.
++                    final GameLocation createLoc = player.getLocation().getGameLocation();
++                    if (createLoc != GameLocation.Avatar && createLoc != GameLocation.Starter)
++                    {
++                        log.warn("{} CHEAT! CreateAvatar from a play location: {}",
++                                user().getUserLog(), createLoc);
++                        return;
++                    }
+ 
+                     if (avatarDescription != null)
+                     {
+@@ -1068,6 +1087,29 @@ public class PlayerProtocol extends BgoProtocol implements StatsProtocolSubscrib
+             }
+         }
+ 
++        // The two capitals are rented by the hour, never bought - their price is dynamic and
++        // their stay in the hangar is a persisted counter, so they take their own path.
++        if (CapitalRental.isRental(shipGuid))
++        {
++            rentCapital(shipCard);
++            return;
++        }
++
++        /* AN EMPTY BuyPrice MEANS NOT FOR SALE, and this is the only place that was missing the
++         * check. checkItemToBuy:698 has it for items; addShip did not, and isEnoughInContainer
++         * loops over the price entries - so zero entries means the loop body never runs and it
++         * returns true. Every hull that ships without a price was therefore free and permanent to
++         * anyone who could get the client to offer it: the rental-only capitals (whose whole
++         * economy is the hourly charge), the outposts, the weapon platforms. The variant buttons
++         * on the carrier cell put a Requisition button on exactly such a hull, so this was
++         * reachable from a stock client with no crafted packet. */
++        if (shopItemCard.getBuyPrice().isEmpty())
++        {
++            log.warn("{} tried to buy ship {}, which has an empty BuyPrice (not for sale)",
++                    user().getUserLog(), shipGuid);
++            return;
++        }
++
+         //check buy price
+         final Price buyPrice = shopItemCard.getBuyPrice();
+         final ShopVisitor shopVisitor = new ShopVisitor(user(), null, ctx.rng());
+@@ -1090,6 +1132,93 @@ public class PlayerProtocol extends BgoProtocol implements StatsProtocolSubscrib
+         }
+     }
+ 
++    /** One hour of Pegasus/Basestar for tokens, priced by CapitalRental against live galaxy
++     *  control. Renting while a rental is active extends it; expiry is swept live by
++     *  CapitalRentalExpiry and re-checked at hangar load in SqLiteProvider. The shop dialog shows
++     *  the Price card's static 20,000 - the amount actually charged is this dynamic one, only
++     *  ever equal or less. */
++    public void rentCapital(final ShipCard shipCard)
++    {
++        final Player player = this.user().getPlayer();
++        final Galaxy galaxy = CDI.current().select(Galaxy.class).get();
++        final long tokens = CapitalRental.priceFor(player.getFaction(), galaxy);
++        final Price rentPrice = new Price(ResourceType.Token, tokens);
++        if (!ContainerVisitor.isEnoughInContainer(rentPrice, player.getHold(), 1))
++        {
++            log.info("Capital rental refused, not enough tokens: {} needs {}", user().getUserLog(), tokens);
++            return;
++        }
++        final ShopVisitor shopVisitor = new ShopVisitor(user(), null, ctx.rng());
++        shopVisitor.removeBuyResources(rentPrice, player.getHold(), 1);
++
++        final long nowSeconds = System.currentTimeMillis() / 1000L;
++        final CounterDesc existing = player.getCounterFacade().counters()
++                .getInternalReadOnly().get(shipCard.getCardGuid());
++        final long base = existing == null ? 0L : existing.getLongValue();
++        final long newExpiry = Math.max(base, nowSeconds) + CapitalRental.DURATION_SECONDS;
++        player.getCounterFacade().setCounter(shipCard.getCardGuid(), newExpiry);
++        log.info("Capital rental: {} rents {} for {} tokens, expires {}",
++                user().getUserLog(), shipCard.getCardGuid(), tokens, newExpiry);
++
++        // Rented hulls live at an offset slot so they never collide with the listed ship that
++        // owns the real hangar id (the stealth ships hold 17 now).
++        final int rentalSlot = CapitalRental.SERVER_ID_OFFSET + shipCard.getHangarId();
++        final CapitalRentalRegistry rentalRegistry = CDI.current().select(CapitalRentalRegistry.class).get();
++        final HangarShip already = player.getHangar().getByServerId(rentalSlot);
++        if (already != null && already.getCardGuid() == shipCard.getCardGuid())
++        {
++            // Extension: the hull is in the hangar, only the clock moved. The slot the pilot came
++            // from was recorded on the first rent - overwriting it now would record the capital
++            // itself as the ship to hand back to.
++            rentalRegistry.extend(player.getUserID(), newExpiry);
++            return;
++        }
++        /* ONE RENTAL AT A TIME. The registry holds a single record per pilot, and the capitals sit
++         * in different hangar slots, so renting a second one while the first is live left the
++         * first hull with no record pointing at it - the sweep compares whichever hull it finds
++         * against that one record, so the older capital simply never expired. Alternating the two
++         * once an hour kept both forever for one fee. Hand the previous one back here, before the
++         * new record overwrites the old. */
++        for (final HangarShip owned : List.copyOf(player.getHangar().getAllHangarShips()))
++        {
++            if (owned.getServerId() != rentalSlot && CapitalRental.isRental(owned.getCardGuid()))
++            {
++                log.info("{} rented {} while still holding {} - taking the older capital back",
++                        user().getUserLog(), shipCard.getCardGuid(), owned.getCardGuid());
++                dropRentalHull(owned.getServerId());
++            }
++        }
++        /* Where to put the pilot back when the hour runs out. Read AFTER the older capital is
++         * gone, so a pilot who was flying it is recorded against a hull they still own rather
++         * than against the slot that just went away. */
++        final int previousSlot = player.getHangar().hasActiveShip()
++                && !CapitalRental.isRental(player.getHangar().getActiveShip().getCardGuid())
++                ? player.getHangar().getActiveShip().getServerId()
++                : 0;
++        rentalRegistry.start(player.getUserID(), newExpiry, previousSlot);
++        player.getCounterFacade().setCounter(CapitalRental.RETURN_SLOT_COUNTER, previousSlot);
++        final HangarShip newShip = new HangarShip(player.getUserID(), rentalSlot, shipCard.getCardGuid(), "");
++        /* Armed before the stats are applied and before the hull is announced, so the AddShip /
++         * Slots / Durability trio below carries the loadout in one go - the client's Reply.Slots
++         * is a full replacement of the ship's slot set, and it does not care whether the systems
++         * exist in the pilot's Hold or Locker. */
++        CapitalRental.arm(newShip);
++        newShip.getShipStats().setSkillBook(player.getSkillBook());
++        newShip.getShipStats().applyStats();
++        newShip.getShipStats().setHp(newShip.getShipStats().getStatOrDefault(ObjectStat.MaxHullPoints));
++        newShip.getShipStats().setPp(newShip.getShipStats().getStatOrDefault(ObjectStat.MaxPowerPoints));
++        player.getHangar().addHangarShip(newShip);
++        user().send(writeAddShip(newShip));
++        user().send(writer.writeShipSlots(newShip));
++        user().send(writer.writeShipInfoDurability(newShip));
++        /* Put the pilot IN it, rather than leaving them to find it in the hangar. The flagship is
++         * a one-hour authorisation, not a purchase, so "you now command the Pegasus" is what the
++         * dialogue actually promised - and it means the rental does not depend on the hangar grid
++         * being able to draw a tier-4 Mothership, which it cannot do without the variant plumbing
++         * on the carrier cell. Undocking now launches the battlestar. */
++        selectShip(rentalSlot);
++    }
++
+     public void addExperience(final long exp)
+     {
+         if (user() == null)
+@@ -1237,6 +1366,79 @@ public class PlayerProtocol extends BgoProtocol implements StatsProtocolSubscrib
+         }
+     }
+ 
++    /** The rented hull a ShipSlot container belongs to, or null for anything else - a non-slot
++     *  container, an unknown ship id, or a hull the pilot actually owns. */
++    private HangarShip rentalSlotHull(final IContainer container)
++    {
++        if (container == null || !(container.getContainerID() instanceof ShipSlotContainerID slotContainerID))
++            return null;
++
++        final HangarShip ship = this.user().getPlayer().getHangar().getByServerId(slotContainerID.getShipID());
++        if (ship == null || !CapitalRental.isRental(ship.getCardGuid()))
++            return null;
++
++        return ship;
++    }
++
++    /**
++     * Takes a rented hull the pilot is NOT flying out of the hangar. Deliberately without the
++     * selectShip half of returnRentalHull: an idle HangarShip has no live SpaceSubscribeInfo (only
++     * the active one is handed to a PlayerShip) and no sector job holds a reference to it, so this
++     * is safe to call from the expiry sweep's thread even while the pilot is in space in something
++     * else.
++     *
++     * @return false when the hull is the active one, which is returnRentalHull's job instead.
++     */
++    public boolean dropRentalHull(final int rentalSlot)
++    {
++        final Hangar hangar = this.user().getPlayer().getHangar();
++        if (hangar.getByServerId(rentalSlot) == null)
++            return false;
++        if (hangar.hasActiveShip() && hangar.getActiveShip().getServerId() == rentalSlot)
++            return false;
++
++        user().send(writeRemoveShip(rentalSlot));
++        hangar.removeHangarShip(rentalSlot);
++        return true;
++    }
++
++    /**
++     * Hands an expired capital rental back: the pilot is moved into the hull they came from and
++     * the rental leaves the hangar on both sides.
++     *
++     * The order is load-bearing. Client-side PlayerHangar._RemoveShip is a bare dictionary
++     * remove - it does not touch activeShip - and _SetActiveShip indexes that same dictionary
++     * hard, so the active hull has to move off the rental first, and it has to move to a slot the
++     * client already knows about. selectShip refuses to run outside a room, so the caller must
++     * have docked the pilot before calling this.
++     *
++     * @return false if the swap could not be made; the rental is then left in place rather than
++     *         leaving the client pointing at a hull it no longer has.
++     */
++    public boolean returnRentalHull(final int rentalSlot, final int returnSlot)
++    {
++        final Player player = this.user().getPlayer();
++        final Hangar hangar = player.getHangar();
++        if (returnSlot == rentalSlot || hangar.getByServerId(returnSlot) == null)
++        {
++            log.warn("Capital rental return: {} has no hull at slot {} to go back to",
++                    user().getUserLog(), returnSlot);
++            return false;
++        }
++
++        selectShip(returnSlot);
++        if (hangar.getActiveShip().getServerId() == rentalSlot)
++        {
++            log.warn("Capital rental return: {} still active in slot {}, keeping the rental",
++                    user().getUserLog(), rentalSlot);
++            return false;
++        }
++
++        user().send(writeRemoveShip(rentalSlot));
++        hangar.removeHangarShip(rentalSlot);
++        return true;
++    }
++
+ 
+     public BgoProtocolWriter writeHpAndPp(final float hp, final float pp)
+     {
+@@ -1281,6 +1483,23 @@ public class PlayerProtocol extends BgoProtocol implements StatsProtocolSubscrib
+         //from container
+         IContainer fromContainer = moveItemParser.getFrom();
+         IContainer toContainer = moveItemParser.getTo();
++
++        /* A rented capital's loadout is issued with the hull and goes back with it. Out of the
++         * slots is a tylium printer - twelve tier-4 systems, 720k at the shop's sell price, for an
++         * hour of tokens - and into them destroys the pilot's own system when the hull is handed
++         * back. ShipSlotVisitor has no active-ship or ownership check of its own, so the refusal
++         * lives here, at the one message that reaches all three of Hold, Locker and Shop. The
++         * client is resynced rather than left showing a move the server did not make. */
++        final HangarShip fromRental = rentalSlotHull(fromContainer);
++        final HangarShip rentalHull = fromRental != null ? fromRental : rentalSlotHull(toContainer);
++        if (rentalHull != null)
++        {
++            log.info("{} tried to move a system in or out of rented hull {}, refused",
++                    user().getUserLog(), rentalHull.getCardGuid());
++            user().send(writer.writeShipSlots(rentalHull));
++            return;
++        }
++
+         //ContainerVisitor visitor = new HoldVisitor(client, moveItemParser);
+         ContainerVisitor visitor = ContainerVisitorFactory.createVisitor(fromContainer.getContainerID().getContainerType(),
+                 user(), moveItemParser, ctx.rng());
+@@ -1353,6 +1572,11 @@ public class PlayerProtocol extends BgoProtocol implements StatsProtocolSubscrib
+         ShipSlotVisitor shipSlotVisitor = new ShipSlotVisitor(user(), null);
+         for (final HangarShip hangarShip : hangar.getAllHangarShips())
+         {
++            /* A rented hull's loadout was never bought, so it must not be banked in the Locker on
++             * the way through. removeAllHangarShips below discards the hull either way. */
++            if (CapitalRental.isRental(hangarShip.getCardGuid()))
++                continue;
++
+             for (ShipSlot slot : hangarShip.getShipSlots().values())
+             {
+                 final ShipItem removedShipItem = slot.removeShipItem();
+@@ -1546,6 +1770,11 @@ public class PlayerProtocol extends BgoProtocol implements StatsProtocolSubscrib
+         final Player player = this.user().getPlayer();
+         for (final HangarShip ship : player.getHangar().getAllHangarShips())
+         {
++            /* Both call sites are places the client rebuilds its hangar from scratch (login, and
++             * sendCharacter after a faction switch), so this is where a rental that came back from
++             * the database with empty bays gets its loadout again. arm() no-ops on a non-rental and
++             * on a bay that is already fitted. */
++            CapitalRental.arm(ship);
+             user().send(writer.writeShipSlots(ship));
+         }
+     }
+@@ -1614,6 +1843,18 @@ public class PlayerProtocol extends BgoProtocol implements StatsProtocolSubscrib
+         return bw;
+     }
+ 
++    /** Counterpart of AddShip: the client drops the hull from its hangar dictionary and fires
++     *  ShipListChanged. It does not move activeShip, so never remove the active hull. */
++    public BgoProtocolWriter writeRemoveShip(final int shipId)
++    {
++        if (shipId < 0) throw new IllegalArgumentException("shipId cannot be negative");
++
++        final BgoProtocolWriter bw = newMessage();
++        bw.writeUInt16(ServerMessage.RemoveShip.value);
++        bw.writeUInt16(shipId);
++        return bw;
++    }
++
+     public BgoProtocolWriter writeCapabilityReset(final Capability capability)
+     {
+         final BgoProtocolWriter bw = newMessage();
+diff --git a/src/main/java/io/github/luigeneric/core/protocols/shop/ShopProtocol.java b/src/main/java/io/github/luigeneric/core/protocols/shop/ShopProtocol.java
+index 79dcfa7..3288f37 100644
+--- a/src/main/java/io/github/luigeneric/core/protocols/shop/ShopProtocol.java
++++ b/src/main/java/io/github/luigeneric/core/protocols/shop/ShopProtocol.java
+@@ -191,9 +191,9 @@ public class ShopProtocol extends BgoProtocol
+ 
+         items.add(ShipSystem.fromGUID(227));
+         items.add(ShipSystem.fromGUID(226));
+-        items.add(ItemCountable.fromGUID(ResourceType.YellowBox, 1));
+-        items.add(ItemCountable.fromGUID(ResourceType.GreenBox, 1));
+-        items.add(ItemCountable.fromGUID(ResourceType.RedBox, 1));
++        // The boxes are deliberately NOT stocked. The trade-in window uses them as *currency*
++        // (eventRessources: [11,12,13]), not as goods, and they ship with an empty BuyPrice - so
++        // stocking them used to mean unlimited free boxes for anyone who clicked buy.
+ 
+         eventShop.addShipItems(items);
+     }

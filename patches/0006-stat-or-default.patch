@@ -1,0 +1,140 @@
+diff --git a/src/main/java/io/github/luigeneric/core/movement/MovementController.java b/src/main/java/io/github/luigeneric/core/movement/MovementController.java
+index 0c6d6bd..7857ea9 100644
+--- a/src/main/java/io/github/luigeneric/core/movement/MovementController.java
++++ b/src/main/java/io/github/luigeneric/core/movement/MovementController.java
+@@ -146,11 +146,11 @@ public abstract class MovementController implements IMovementUpdateSubscriber
+             }
+             case Boost ->
+             {
+-                movementOptions.setSpeed(stats.getStat(ObjectStat.BoostSpeed));
++                movementOptions.setSpeed(stats.getStatOrDefault(ObjectStat.BoostSpeed));
+             }
+             case None ->
+             {
+-                movementOptions.setSpeed(stats.getStat(ObjectStat.Speed));
++                movementOptions.setSpeed(stats.getStatOrDefault(ObjectStat.Speed));
+             }
+         }
+ 
+diff --git a/src/main/java/io/github/luigeneric/core/protocols/game/GameProtocol.java b/src/main/java/io/github/luigeneric/core/protocols/game/GameProtocol.java
+index 3f48b97..da8f8ed 100644
+--- a/src/main/java/io/github/luigeneric/core/protocols/game/GameProtocol.java
++++ b/src/main/java/io/github/luigeneric/core/protocols/game/GameProtocol.java
+@@ -357,7 +357,7 @@ public class GameProtocol extends BgoProtocol implements StatsProtocolSubscriber
+                     return;
+                 }
+                 final MapStarDesc sourceStar = optSourceStar.get();
+-                final float ftlJumpRange = playerShip.getSpaceSubscribeInfo().getStat(ObjectStat.FtlRange);
++                final float ftlJumpRange = playerShip.getSpaceSubscribeInfo().getStatOrDefault(ObjectStat.FtlRange);
+                 final float jumpDistance = Vector2.distance(sourceStar.getPosition(), starDestination.getPosition());
+                 final boolean canJumpDistance = jumpDistance <= ftlJumpRange;
+                 final boolean canJumpFaction = starDestination.canJumpFaction(playerShip.getFaction());
+@@ -376,7 +376,7 @@ public class GameProtocol extends BgoProtocol implements StatsProtocolSubscriber
+                     log.warn("Cheating user tried to jump while modified " + user().getUserLog());
+                 }
+ 
+-                final float charge = playerShip.getSpaceSubscribeInfo().getStat(ObjectStat.FtlCharge);
++                final float charge = playerShip.getSpaceSubscribeInfo().getStatOrDefault(ObjectStat.FtlCharge);
+                 final boolean isInCombat = playerShip.getSpaceSubscribeInfo().isInCombat();
+ 
+                 this.jumpProcedure(secPlayerShip.sector().getJumpRegistry(), sectorID, charge, isInCombat);
+@@ -486,12 +486,20 @@ public class GameProtocol extends BgoProtocol implements StatsProtocolSubscriber
+             }
+             case CompleteJump ->
+             {
++                /* The flag is set BEFORE the presence check now. The client sends CompleteJump
++                 * once its own player ship has loaded, but the server-side ship comes out of the
++                 * SectorJoinQueue on a sector tick - lose that race and the old early return
++                 * dropped the one message that ever starts the ghost-jump state machine, leaving
++                 * the player invisible under a stuck "perform any action" overlay (see
++                 * PlayerVisibility, which now also self-heals). The flag is an AtomicBoolean the
++                 * VisibilityTimer only consumes once a ship exists, so setting it early is safe;
++                 * the warn stays because the race is worth counting. */
++                this.completeJumpFlag.set(true);
+ 
+                 final SectorPlayerShipFetchResult secPlayerShip = getSectorAndPlayerShip();
+                 if (!secPlayerShip.bothPresent())
+                 {
+-                    log.warn("Cheat {} RequestCompleteJump but sector or ship not present", user().getUserLog());
+-                    return;
++                    log.warn("CompleteJump before ship present (join-queue race) - flag kept for the VisibilityTimer {}", user().getUserLog());
+                 }
+ 
+                 /*
+@@ -501,7 +509,6 @@ public class GameProtocol extends BgoProtocol implements StatsProtocolSubscriber
+                 this.sector.getSectorSender().sendToAllClients(bw);
+                 this.user().send(bw);
+                  */
+-                this.completeJumpFlag.set(true);
+             }
+             case SelectRespawnLocation ->
+             {
+@@ -673,7 +680,7 @@ public class GameProtocol extends BgoProtocol implements StatsProtocolSubscriber
+                 final MovementController movementController = playerShip.getMovementController();
+                 final MovementOptions movementOptions = movementController.getMovementOptions();
+                 float speed = 0;
+-                float acceleration = playerShip.getSpaceSubscribeInfo().getStat(ObjectStat.Acceleration);
++                float acceleration = playerShip.getSpaceSubscribeInfo().getStatOrDefault(ObjectStat.Acceleration);
+                 switch (newGear)
+                 {
+                     case Regular ->
+@@ -683,8 +690,8 @@ public class GameProtocol extends BgoProtocol implements StatsProtocolSubscriber
+ 
+                     case Boost ->
+                     {
+-                        speed = playerShip.getSpaceSubscribeInfo().getStat(ObjectStat.BoostSpeed);
+-                        final float accBonus = playerShip.getSpaceSubscribeInfo().getStat(ObjectStat.AccelerationMultiplierOnBoost);
++                        speed = playerShip.getSpaceSubscribeInfo().getStatOrDefault(ObjectStat.BoostSpeed);
++                        final float accBonus = playerShip.getSpaceSubscribeInfo().getStatOrDefault(ObjectStat.AccelerationMultiplierOnBoost, 1f);
+                         acceleration *= accBonus;
+                         if (movementController.getCurrentManeuver() != null && movementController.getCurrentManeuver() instanceof TurnByPitchYawStrikes oldTurnByPitchYawStrikes)
+                         {
+@@ -739,7 +746,7 @@ public class GameProtocol extends BgoProtocol implements StatsProtocolSubscriber
+                 final MovementController movementController = playerShip.getMovementController();
+                 final Maneuver maneuver = movementController.getCurrentManeuver();
+                 final MovementOptions movementOptions = movementController.getMovementOptions();
+-                final float maxSpeed = playerShip.getSpaceSubscribeInfo().getStat(ObjectStat.Speed);
++                final float maxSpeed = playerShip.getSpaceSubscribeInfo().getStatOrDefault(ObjectStat.Speed);
+ 
+ 
+                 final float clientSpeedCleaned = Mathf.clampSafe(clientSpeed, 0, maxSpeed);
+@@ -838,6 +845,24 @@ public class GameProtocol extends BgoProtocol implements StatsProtocolSubscriber
+                     log.error("Caught cheating by docking on nondockable ship " + user().getPlayer().getPlayerLog());
+                     return;
+                 }
++                /* YOU MAY ONLY DOCK AT YOUR OWN FACTION'S STATION. IsDockable is a property of the
++                 * CARD, so it says "this is a station", not "this station will have you" - there was
++                 * no faction check anywhere on this path. That was harmless while outposts were
++                 * inert scenery, and stopped being harmless the moment they shot back: an attacker
++                 * could sit inside an enemy outpost's guns and dock to escape on demand, which makes
++                 * the dock button a guaranteed get-out and the dominant tactic in every outpost
++                 * fight. Every dockable object in the catalogue - both cruisers and both outposts -
++                 * carries a real Colonial/Cylon faction, so exact equality is safe here; there is no
++                 * Neutral dockable object for it to lock out. The party-anchor path above needs no
++                 * equivalent check because it already requires the target to be in your party. */
++                if (spaceObjectToDockAt.getFaction() != user().getPlayer().getFaction())
++                {
++                    log.warn("{} tried to dock at {} station {} - refused",
++                            user().getUserLogSimple(), spaceObjectToDockAt.getFaction(), dockObjectID);
++                    user().send(ProtocolRegistryWriteOnly.writeDebugMessage(
++                            "You cannot dock at an enemy station"));
++                    return;
++                }
+                 final Vector3 playerPos = playerShip.getMovementController().getPosition();
+                 final Vector3 dockPos = spaceObjectToDockAt.getMovementController().getPosition();
+                 final float distance = Vector3.distance(playerPos, dockPos);
+@@ -915,6 +940,14 @@ public class GameProtocol extends BgoProtocol implements StatsProtocolSubscriber
+                 usersToJump.add(partyMember);
+             }
+         }
++        /* A fortified carrier does not leave. Solo jumps are already refused - Outpost Mode
++         * multiplies FtlRange by zero and the jump path measures against it - but a group jump
++         * takes its members along without consulting anyone's range, which would have let a
++         * party leader tow the fortress out and undo the whole tradeoff. */
++        usersToJump.removeIf(userToJump -> currentSector.getCtx().users()
++                .getPlayerShipByUserID(userToJump.getPlayer().getUserID())
++                .map(ship -> ship.getSpaceObjectState().getIsFortified())
++                .orElse(false));
+ 
+         //find the highest class
+ 

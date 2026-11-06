@@ -1,0 +1,104 @@
+diff --git a/src/main/java/io/github/luigeneric/core/sector/creation/SectorFactory.java b/src/main/java/io/github/luigeneric/core/sector/creation/SectorFactory.java
+index 6bd4908..2909eca 100644
+--- a/src/main/java/io/github/luigeneric/core/sector/creation/SectorFactory.java
++++ b/src/main/java/io/github/luigeneric/core/sector/creation/SectorFactory.java
+@@ -114,20 +114,44 @@ public class SectorFactory
+     }
+ 
+     /**
+-     * WIP guess lEgAcY cOdE
++     * Seed each faction's outpost points, i.e. decide who already holds this system when the
++     * server comes up.
++     * <p>
++     * This replaces two hardcoded sector ids - 27 seeded 3000 Cylon points and 47 seeded 3000
++     * Colonial - with the rule those two are instances of: a system only ONE faction may hold an
++     * outpost in is held by that faction from the start, and a system both may hold starts empty
++     * and has to be taken. Nothing else changes; the whole conquest mechanic
++     * (SectorOutpostProgress, OutpostDecreaseTimer, the 900-point spawn threshold, the 60-minute
++     * block after a death) still runs exactly as before, and a seeded outpost can be destroyed and
++     * lost like any other.
++     * <p>
++     * The reason to generalise rather than extend the list: with the galaxy at three sectors the
++     * two ids were most of the data, and with 58 they are 3% of it. A map where 24 faction-held
++     * systems show no owner is not a neutral default - the client draws outpost ownership on every
++     * galaxy tile (GalaxyMapSector.cs:146-160), so an unseeded galaxy actively displays "nobody
++     * holds anything anywhere", which is not what the map looked like.
++     * <p>
++     * The eligibility flags come from the star, so this stays in sync with the GalaxyMap card and
++     * with what the sector template can actually honour - a seeded faction with no Outpost entry in
++     * its template would just log the warning in OutpostSpawnTimer.spawnOp rather than spawn.
++     * <p>
++     * NOTE on sector 47. The rule reproduces upstream's 27 (Spectris is cylon_controlled) but NOT
++     * its 47: our sources put Vidofnir in the contested group, so it starts unheld and its
++     * CanColonialOutpost flag is true only because contested systems allow either side. If the
++     * literal 47 was load-bearing for some reason we have not found, this is where it went.
++     *
+      * @return wrapper object OutPostStates hard wired two states (there is only one op each faction)
+      */
+     private OutPostStates setupOutpostStates(final SectorBlueprint sectorBlueprint, final MapStarDesc starDesc, final Tick tick)
+     {
+-        int coloOpPts = 0;
+-        int cyloOpPts = 0;
+-        if (sectorBlueprint.sectorDesc().getSectorID() == 27)
+-        {
+-            cyloOpPts = 3000;
+-        } else if (sectorBlueprint.sectorDesc().getSectorID() == 47)
+-        {
+-            coloOpPts = 3000;
+-        }
++        final boolean colonialMayHold = starDesc.isCanColonialOutpost();
++        final boolean cylonMayHold = starDesc.isCanCylonOutpost();
++
++        /* 3000 is the clamp ceiling (OutpostState.increasePoints), well above the 900 the spawn
++         * needs, so a held system survives a spell of enemy activity before it flips - the same
++         * head start upstream gave its two. */
++        final int coloOpPts = (colonialMayHold && !cylonMayHold) ? 3000 : 0;
++        final int cyloOpPts = (cylonMayHold && !colonialMayHold) ? 3000 : 0;
+ 
+         return new OutPostStates(
+                 new OutpostState(Faction.Colonial, coloOpPts, 3600, starDesc.isCanColonialOutpost(), tick),
+@@ -340,7 +364,9 @@ public class SectorFactory
+ 
+         timers.add(new SpaceObjectPropertiesTimer(tick, spaceObjects, Utils.timeToTicks(TimeUnit.SECONDS, 0.1f)));
+         timers.add(new ShipModifierTimeoutTimer(spaceObjects));
+-        timers.add(new NpcStaticTimer(tick, spaceObjects, Utils.timeToTicks(TimeUnit.SECONDS, 5),
++        // Outpost Mode's per-second power drain; releases the mode when the reserves run out.
++        timers.add(new FortifyUpkeepTimer(tick, spaceObjects, Utils.timeToTicks(TimeUnit.SECONDS, 1)));
++        timers.add(new NpcStaticTimer(tick, spaceObjects, Utils.timeToTicks(TimeUnit.SECONDS, 2),
+                 abilityCastRequestQueue, sectorDamageHistory, sectorCards));
+         timers.add(new NpcDynamicTimer(tick, spaceObjects, Utils.timeToTicks(TimeUnit.SECONDS, 3),
+                 abilityCastRequestQueue, sectorDamageHistory, remover, sectorCards, ctx.bgoRandom()));
+@@ -348,12 +374,15 @@ public class SectorFactory
+         timers.add(new LogoutTimer(tick, spaceObjects, Utils.timeToTicks(TimeUnit.SECONDS, 10f), users, remover));
+         timers.add(new BoostCostTimer(tick, spaceObjects, Utils.timeToTicks(TimeUnit.SECONDS, 1), users, sectorCards.sectorCard()));
+ 
++        /* Comets. Switched off while the card set at guid 23 was incomplete - the client's
++         * Comet.Read depends on a Missile card there and cards.js did not emit one, so a spawned
++         * comet never finished loading client-side while the server flew it and killed anything
++         * it touched. The card ships now, so the timer runs wherever a sector template asks for
++         * it: only sector 10 today (upstream's own cometSectorDesc), which is the pilot. */
+         if (sectorDesc.getCometSectorDesc().activated())
+         {
+-            /*
+             timers.add(new CometTimer(tick, spaceObjects, Utils.timeToTicks(TimeUnit.SECONDS, sectorDesc.getCometSectorDesc().delaySeconds()),
+                     factory, joinQueue, sectorDesc.getCometSectorDesc()));
+-             */
+         }
+ 
+         final NotificationTimer notificationTimer = new NotificationTimer(tick, spaceObjects, Utils.timeToTicks(TimeUnit.SECONDS, 7),
+@@ -389,6 +418,15 @@ public class SectorFactory
+             {
+                 continue;
+             }
++            /* Ring platforms belong to the outpost, not the sector: OutpostSpawnTimer spawns
++             * them alongside its outpost and swaps their tier with the control level. A platform
++             * template within RING_NEAR of a same-faction Outpost template is a ring member;
++             * free-standing platforms still spawn statically here. */
++            if (spaceObjectTemplate.getSpaceEntityType() == SpaceEntityType.WeaponPlatform
++                    && OutpostSpawnTimer.isRingMember((StaticNpcTemplate) spaceObjectTemplate, sectorDesc))
++            {
++                continue;
++            }
+             final float spawnTime = spaceObjectTemplate.isInstantInSector() ? 0 : getSpawnDelay(spaceObjectTemplate, sectorDesc);
+             final SpawnController spawnController = sector.getSpawnController();
+             try

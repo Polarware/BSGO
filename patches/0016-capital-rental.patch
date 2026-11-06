@@ -1,0 +1,1036 @@
+diff --git a/src/main/java/io/github/luigeneric/core/CapitalRentalExpiry.java b/src/main/java/io/github/luigeneric/core/CapitalRentalExpiry.java
+new file mode 100644
+index 0000000..8b6fa94
+--- /dev/null
++++ b/src/main/java/io/github/luigeneric/core/CapitalRentalExpiry.java
+@@ -0,0 +1,316 @@
++package io.github.luigeneric.core;
++
++import io.github.luigeneric.core.player.Hangar;
++import io.github.luigeneric.core.player.HangarShip;
++import io.github.luigeneric.core.player.Player;
++import io.github.luigeneric.core.player.counters.CounterDesc;
++import io.github.luigeneric.core.player.location.CICLocation;
++import io.github.luigeneric.core.player.location.Location;
++import io.github.luigeneric.core.player.location.OutpostLocation;
++import io.github.luigeneric.core.protocols.ProtocolID;
++import io.github.luigeneric.core.protocols.ProtocolRegistryWriteOnly;
++import io.github.luigeneric.core.protocols.game.GameProtocolWriteOnly;
++import io.github.luigeneric.core.protocols.player.CapitalRental;
++import io.github.luigeneric.core.protocols.player.PlayerProtocol;
++import io.github.luigeneric.core.protocols.scene.SceneProtocol;
++import io.github.luigeneric.core.sector.Sector;
++import io.github.luigeneric.core.sector.management.SectorRegistry;
++import io.github.luigeneric.core.spaceentities.PlayerShip;
++import io.github.luigeneric.enums.GameLocation;
++import io.github.luigeneric.enums.RemovingCause;
++import io.github.luigeneric.utils.Utils;
++import io.quarkus.scheduler.Scheduled;
++import jakarta.enterprise.context.ApplicationScoped;
++import jakarta.inject.Inject;
++import lombok.extern.slf4j.Slf4j;
++
++import java.util.HashSet;
++import java.util.List;
++import java.util.Optional;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++
++/**
++ * Takes a rented capital back when the hour is up: the pilot is docked where they are, put back in
++ * the hull they came from, and the rental leaves the hangar.
++ *
++ * A sector timer would be the wrong hook - a rental has to run out while the pilot is standing in
++ * the CIC too, and sector timers only see ships in space. The tick is coarse because the rental
++ * lasts an hour and every tick walks every connected player.
++ *
++ * The sweep runs on the Quarkus scheduler thread, not a sector thread, and that is what shapes the
++ * whole of expireIfDue:
++ *
++ *  - A pilot who parked the capital and is flying something else is never touched in space. Their
++ *    rental is an idle HangarShip with no live SpaceSubscribeInfo, so it is simply dropped.
++ *  - A pilot who IS flying it is docked in one sweep and swapped out of the hull in a later one.
++ *    The two halves cannot be run together: an in-space PlayerShip shares the active HangarShip's
++ *    SpaceSubscribeInfo instance (SpaceObjectFactory.createPlayerShip), and selectShip clears that
++ *    object's subscriber map - which the sector thread is still reading until the dock drains.
++ *    readyForSwap gates the second half on the drain itself, not on the location flag, and on two
++ *    sweeps agreeing that it happened.
++ *  - The pilot's sectorID is never rewritten. Docking in place is what GameProtocol.dockProcedure
++ *    does; moving them to the home CIC first would make GameProtocol.getSector() resolve a sector
++ *    their PlayerShip is not in for as long as the drain takes, and the unguarded
++ *    getSectorAndPlayerShip() callers NPE into a disconnect.
++ *
++ * The hangar load in SqLiteProvider stays as the offline backstop for rentals that ran out while
++ * the player was away.
++ */
++@Slf4j
++@ApplicationScoped
++public class CapitalRentalExpiry
++{
++    private final UsersContainer usersContainer;
++    private final SectorRegistry sectorRegistry;
++    private final CapitalRentalRegistry rentalRegistry;
++    private final GameProtocolWriteOnly gameWriter;
++    /* Users whose sector has already been seen to hold no PlayerShip for them once. SectorUsers
++     * keeps that lookup in a plain HashMap that only the sector thread mutates, so a single read
++     * from this thread can miss an entry that is genuinely there - and a miss in the wrong
++     * direction is exactly the unsafe swap this class exists to avoid. Two sweeps have to agree,
++     * which puts fifteen seconds and thousands of sector ticks between the reading and the
++     * selectShip. */
++    private final Set<Long> drainObserved = ConcurrentHashMap.newKeySet();
++
++    @Inject
++    public CapitalRentalExpiry(final UsersContainer usersContainer,
++                               final SectorRegistry sectorRegistry,
++                               final CapitalRentalRegistry rentalRegistry)
++    {
++        this.usersContainer = usersContainer;
++        this.sectorRegistry = sectorRegistry;
++        this.rentalRegistry = rentalRegistry;
++        this.gameWriter = ProtocolRegistryWriteOnly.game();
++    }
++
++    /* 15s against an hour-long rental. The interval is also the spacing of the phased hand-back:
++     * a dock drains on the next sector tick, tens of milliseconds later, so waiting whole sweeps
++     * costs a pilot at most 30 seconds of overdue flagship and buys a very wide margin. */
++    @Scheduled(every = "15s")
++    public void run()
++    {
++        final long nowSeconds = System.currentTimeMillis() / 1000L;
++        final List<User> users = this.usersContainer.userList(User::isConnected);
++        final Set<Long> connectedIds = new HashSet<>(users.size());
++
++        for (final User user : users)
++        {
++            connectedIds.add(user.getPlayer().getUserID());
++            try
++            {
++                expireIfDue(user, nowSeconds);
++            }
++            catch (final Exception exception)
++            {
++                // One broken hangar must not stop the sweep for everybody else.
++                log.error("Capital rental sweep failed for {}: {}",
++                        user.getUserLogSimple(), Utils.getExceptionStackTrace(exception));
++            }
++        }
++
++        this.rentalRegistry.pruneExpiredOffline(connectedIds, nowSeconds);
++        this.drainObserved.retainAll(connectedIds);
++    }
++
++    private void expireIfDue(final User user, final long nowSeconds)
++    {
++        final Player player = user.getPlayer();
++        final long userId = player.getUserID();
++        final Hangar hangar = player.getHangar();
++        final HangarShip rental = findRentalHull(hangar);
++        final CapitalRentalRegistry.Rental tracked = this.rentalRegistry.get(userId);
++
++        if (rental == null)
++        {
++            if (tracked != null && tracked.expirySeconds() <= nowSeconds)
++                this.rentalRegistry.clear(userId);
++            return;
++        }
++
++        /* No record at all means the hull outlived the record - a restart, or a counter that was
++         * dropped for want of a Counter card. Treat that as expired, which is what the hangar
++         * load in SqLiteProvider does with the same hull. */
++        final long expiry = tracked != null
++                ? tracked.expirySeconds()
++                : counterValue(player, rental.getCardGuid());
++        if (expiry > nowSeconds)
++            return;
++
++        final int rentalSlot = rental.getServerId();
++        final PlayerProtocol playerProtocol = user.getProtocol(ProtocolID.Player);
++
++        /* The pilot is not in it. Nothing to dock, nothing to swap, no return slot to pick - just
++         * take the hull. An idle HangarShip is reachable from no sector job, so this is safe from
++         * this thread even while the pilot is mid-fight in something else. */
++        if (!hangar.hasActiveShip() || hangar.getActiveShip().getServerId() != rentalSlot)
++        {
++            if (!playerProtocol.dropRentalHull(rentalSlot))
++                return;     // vanished between findRentalHull and here; a later sweep tidies up
++
++            clearRentalRecord(player, rental.getCardGuid());
++            log.info("Capital rental expired for {}: {} taken back, pilot was not flying it",
++                    user.getUserLogSimple(), rental.getCardGuid());
++            return;
++        }
++
++        final int returnSlot = pickReturnSlot(player, hangar, tracked, rentalSlot);
++        if (returnSlot <= 0)
++        {
++            // Nothing else to fly. Stranding the pilot is worse than an overdue flagship.
++            log.warn("Capital rental expired for {} but no other hull to return to, keeping it",
++                    user.getUserLogSimple());
++            return;
++        }
++
++        if (!readyForSwap(user, player))
++            return;     // docking was enqueued, or is still draining; a later sweep finishes it
++
++        if (!playerProtocol.returnRentalHull(rentalSlot, returnSlot))
++            return;
++
++        clearRentalRecord(player, rental.getCardGuid());
++        log.info("Capital rental expired for {}: {} returned, pilot back in slot {}",
++                user.getUserLogSimple(), rental.getCardGuid(), returnSlot);
++    }
++
++    /**
++     * Whether the ship swap can be made from this thread right now, and the place the pilot gets
++     * docked if it cannot yet.
++     *
++     * The barrier is the drain, not the location. A pilot is put in a room the instant the dock is
++     * enqueued - dockProcedure does the same - but their PlayerShip stays in the sector until
++     * SpaceObjectRemover.run() takes it out, and until then the sector thread is still reading the
++     * SpaceSubscribeInfo that selectShip is about to reassign. SpaceObjectRemover drops the user
++     * from the sector's user list as part of that same drain, so "no PlayerShip for this user"
++     * is exactly the signal that nothing on the sector thread can still reach it.
++     *
++     * @return true only when the pilot is in a room and two sweeps running have found no ship of
++     *         theirs left in their sector.
++     */
++    private boolean readyForSwap(final User user, final Player player)
++    {
++        final long userId = player.getUserID();
++        final GameLocation gameLocation = player.getLocation().getGameLocation();
++        if (gameLocation != GameLocation.Space && gameLocation != GameLocation.Room)
++        {
++            // Avatar, zone, starter, mid-jump: no safe place to drop them. Try again next sweep.
++            this.drainObserved.remove(userId);
++            return false;
++        }
++
++        /* getSectorId() is untouched by anything below, so this resolves the sector the pilot's
++         * ship is actually in - during a dock that is still the sector they were flying in. */
++        final Optional<Sector> optSector = this.sectorRegistry.getSectorById(player.getSectorId());
++        final Optional<PlayerShip> optPlayerShip = optSector.flatMap(sector ->
++                sector.getCtx().users().getPlayerShipByUserID(userId));
++
++        if (optPlayerShip.isPresent())
++        {
++            final PlayerShip playerShip = optPlayerShip.get();
++            this.drainObserved.remove(userId);
++
++            if (playerShip.isRemoved())
++                return false;   // marked this tick, off the list on the next; the sweep comes back
++
++            /* Already in a room with a ship still listed: something else is docking them, or the
++             * drain has not run yet. Either way it is not ours to push - re-docking a docked pilot
++             * would only throw a scene reload at them. */
++            if (gameLocation != GameLocation.Space)
++                return false;
++
++            /* A dock the pilot started themselves is already sitting in GameProtocol's own future,
++             * which we cannot cancel from here. Enqueueing a second removal would only log a
++             * warning and its runnable would set the location again after ours. Let it land. */
++            if (playerShip.getSpaceObjectState().getIsDocking())
++                return false;
++
++            dockInPlace(user, player, optSector.get(), playerShip);
++            return false;
++        }
++
++        /* Drained, or never in space at all. In Space it is a pilot whose sector join has not
++         * produced a ship yet - not a drain, so the count starts over. */
++        if (gameLocation != GameLocation.Room)
++        {
++            this.drainObserved.remove(userId);
++            return false;
++        }
++
++        // add() is false only on the second and later sweeps that agree.
++        return !this.drainObserved.add(userId);
++    }
++
++    /**
++     * Docks the pilot where they are - same sector, CIC or outpost, exactly what
++     * GameProtocol.dockProcedure's runnable does. Two things are deliberately not done here: the
++     * sectorID is not rewritten (see the class comment), and no hull swap is attempted, because
++     * the ship this enqueues for removal is still live on the sector thread.
++     */
++    private void dockInPlace(final User user, final Player player, final Sector sector,
++                             final PlayerShip playerShip)
++    {
++        playerShip.getSpaceObjectState().setDocking(true);
++        user.send(this.gameWriter.writeDockingDelay(0f));
++        // Enqueue only; the sector thread drains it on its next tick. Safe from this thread.
++        sector.getSpaceObjectRemover().notifyRemovingCauseAdded(playerShip, RemovingCause.Dock);
++
++        final Location location = player.getLocation();
++        final long sectorId = location.getSectorID();
++        // Alpha Ceti and Tartalon are the two CICs; everything else docks to an outpost.
++        location.changeState(sectorId == 0 || sectorId == 6
++                ? new CICLocation(location)
++                : new OutpostLocation(location));
++        final SceneProtocol sceneProtocol = user.getProtocol(ProtocolID.Scene);
++        sceneProtocol.sendLoadNextScene();
++
++        log.info("Capital rental expired for {}, docking in sector {} before the hull goes back",
++                user.getUserLogSimple(), sectorId);
++    }
++
++    private void clearRentalRecord(final Player player, final long rentalGuid)
++    {
++        player.getCounterFacade().setCounter(rentalGuid, 0);
++        player.getCounterFacade().setCounter(CapitalRental.RETURN_SLOT_COUNTER, 0);
++        this.rentalRegistry.clear(player.getUserID());
++        this.drainObserved.remove(player.getUserID());
++    }
++
++    private HangarShip findRentalHull(final Hangar hangar)
++    {
++        for (final HangarShip hangarShip : hangar.getAllHangarShips())
++        {
++            if (CapitalRental.isRental(hangarShip.getCardGuid()))
++                return hangarShip;
++        }
++        return null;
++    }
++
++    /** The recorded hull if it is still there, otherwise the best one left - never the rental. */
++    private int pickReturnSlot(final Player player, final Hangar hangar,
++                               final CapitalRentalRegistry.Rental tracked, final int rentalSlot)
++    {
++        final int recorded = tracked != null
++                ? tracked.returnSlot()
++                : (int) counterValue(player, CapitalRental.RETURN_SLOT_COUNTER);
++        if (recorded > 0 && recorded != rentalSlot && hangar.getByServerId(recorded) != null)
++            return recorded;
++
++        HangarShip best = null;
++        for (final HangarShip hangarShip : hangar.getAllHangarShips())
++        {
++            if (hangarShip.getServerId() == rentalSlot || CapitalRental.isRental(hangarShip.getCardGuid()))
++                continue;
++            if (best == null || hangarShip.getShipCard().getTier() > best.getShipCard().getTier())
++                best = hangarShip;
++        }
++        return best == null ? -1 : best.getServerId();
++    }
++
++    private long counterValue(final Player player, final long counterGuid)
++    {
++        final CounterDesc desc = player.getCounterFacade().counters()
++                .getInternalReadOnly().get(counterGuid);
++        return desc == null ? 0L : desc.getLongValue();
++    }
++}
+diff --git a/src/main/java/io/github/luigeneric/core/CapitalRentalRegistry.java b/src/main/java/io/github/luigeneric/core/CapitalRentalRegistry.java
+new file mode 100644
+index 0000000..80155e2
+--- /dev/null
++++ b/src/main/java/io/github/luigeneric/core/CapitalRentalRegistry.java
+@@ -0,0 +1,71 @@
++package io.github.luigeneric.core;
++
++import io.quarkus.arc.Unremovable;
++import jakarta.enterprise.context.ApplicationScoped;
++
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++
++/**
++ * Live bookkeeping for capital rentals: when the hour runs out, and which hangar slot the pilot
++ * flew before they took the flagship.
++ *
++ * The same two values are written to the player's counters so they can outlive a restart, but
++ * Counters.injectOldCounters silently drops any counter whose guid has no Counter card and guids
++ * 5017/5117 have none, so that write is a no-op today. Until those cards exist this map is the
++ * only place a rental's expiry is actually recorded, which is why CapitalRentalExpiry reads here
++ * first and only falls back to the counters.
++ *
++ * Keyed by userID rather than User, so a reconnect within the hour keeps its rental.
++ */
++/* @Unremovable is load-bearing, not decoration. Quarkus prunes beans it cannot see used at BUILD
++ * time, and this one is only ever obtained through a runtime CDI.current().select() in
++ * PlayerProtocol. CapitalRentalExpiry's @Scheduled happens to keep the chain alive today, but that
++ * is coincidence: the last time the sweep was disabled the registry became build-time-unreferenced,
++ * was pruned, and every rental attempt died with UnsatisfiedResolutionException - taking the
++ * player's connection down with it. The annotation stays whatever the sweep does. */
++@Unremovable
++@ApplicationScoped
++public class CapitalRentalRegistry
++{
++    /** @param returnSlot 0 when unknown - hangar ids start at 1. */
++    public record Rental(long expirySeconds, int returnSlot)
++    {
++    }
++
++    private final Map<Long, Rental> rentals = new ConcurrentHashMap<>();
++
++    public void start(final long userId, final long expirySeconds, final int returnSlot)
++    {
++        this.rentals.put(userId, new Rental(expirySeconds, returnSlot));
++    }
++
++    /** Re-renting while the hull is still in the hangar only moves the clock; the slot recorded
++     *  on the first rent has to survive, or expiry would try to hand the pilot back the capital. */
++    public void extend(final long userId, final long expirySeconds)
++    {
++        this.rentals.compute(userId, (id, old) ->
++                new Rental(expirySeconds, old == null ? 0 : old.returnSlot()));
++    }
++
++    public Rental get(final long userId)
++    {
++        return this.rentals.get(userId);
++    }
++
++    public void clear(final long userId)
++    {
++        this.rentals.remove(userId);
++    }
++
++    /** An entry for a pilot who has logged off is dead weight once its clock has run out - the
++     *  hangar load in SqLiteProvider removes an expired hull before they can fly it again. Only
++     *  expired entries are dropped, so an entry written a moment before its hull reaches the
++     *  hangar is never mistaken for garbage. */
++    public void pruneExpiredOffline(final Set<Long> connectedUserIds, final long nowSeconds)
++    {
++        this.rentals.entrySet().removeIf(entry ->
++                entry.getValue().expirySeconds() <= nowSeconds && !connectedUserIds.contains(entry.getKey()));
++    }
++}
+diff --git a/src/main/java/io/github/luigeneric/core/player/Hangar.java b/src/main/java/io/github/luigeneric/core/player/Hangar.java
+index ae8fb9d..4e5fabd 100644
+--- a/src/main/java/io/github/luigeneric/core/player/Hangar.java
++++ b/src/main/java/io/github/luigeneric/core/player/Hangar.java
+@@ -70,6 +70,30 @@ public class Hangar extends InfoPublisher<HangarShipsUpdate>
+         }
+     }
+ 
++    /** Removes one ship (capital-rental expiry). If it was the active ship, activation falls
++     *  back to any remaining hull so the index never dangles. No client message exists for
++     *  this, so it only runs where the client rebuilds its hangar anyway (login). */
++    public void removeHangarShip(final int serverId)
++    {
++        writeLock();
++        try
++        {
++            this.ships.remove(serverId);
++            if (this.activeShipIndex == serverId)
++            {
++                this.activeShipIndex = this.ships.isEmpty() ? -1 : this.ships.keySet().iterator().next();
++            }
++            if (!this.ships.isEmpty())
++            {
++                hangarShipsUpdate();
++            }
++        }
++        finally
++        {
++            writeUnlock();
++        }
++    }
++
+     private void hangarShipsUpdate()
+     {
+         this.set(new HangarShipsUpdate(getActiveShip().getName(), getSortedGUIDs()));
+diff --git a/src/main/java/io/github/luigeneric/core/protocols/dialog/DialogProtocol.java b/src/main/java/io/github/luigeneric/core/protocols/dialog/DialogProtocol.java
+index 4ff4531..88ed640 100644
+--- a/src/main/java/io/github/luigeneric/core/protocols/dialog/DialogProtocol.java
++++ b/src/main/java/io/github/luigeneric/core/protocols/dialog/DialogProtocol.java
+@@ -9,17 +9,144 @@ import io.github.luigeneric.core.player.Player;
+ import io.github.luigeneric.core.protocols.BgoProtocol;
+ import io.github.luigeneric.core.protocols.ProtocolID;
+ import io.github.luigeneric.core.protocols.ProtocolRegistryWriteOnly;
++import io.github.luigeneric.core.player.container.visitors.ContainerVisitor;
++import io.github.luigeneric.core.player.container.visitors.ShopVisitor;
++import io.github.luigeneric.templates.utils.Price;
++import io.github.luigeneric.enums.ResourceType;
++import io.github.luigeneric.templates.shipitems.ItemCountable;
++import io.github.luigeneric.core.protocols.player.CapitalRental;
++import io.github.luigeneric.core.protocols.player.PlayerProtocol;
+ import io.github.luigeneric.core.protocols.player.PlayerProtocolWriteOnly;
++import io.github.luigeneric.enums.Faction;
++import io.github.luigeneric.templates.cards.CardView;
++import io.github.luigeneric.templates.cards.ShipCard;
++import io.github.luigeneric.templates.catalogue.Catalogue;
++import jakarta.enterprise.inject.spi.CDI;
+ import io.github.luigeneric.utils.BgoRandom;
+ import lombok.extern.slf4j.Slf4j;
+ 
+ import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Set;
+ import java.util.List;
+ 
+ @Slf4j
+ public class DialogProtocol extends BgoProtocol
+ {
++    /* Phrase ids from the original game's own dialogue, which is still in the client's locale
++     * bundle. The client resolves "%$bgo.<key>.Phrase__<uuid>__<n>%" and substitutes
++     * %CapShipCost% from the conquest price the galaxy update carries (Gui/Tools.cs:118), so the
++     * merit cost in these lines is the live rental price without the server formatting anything.
++     *
++     * Colonial: Admiral Adama authorises the Pegasus. Cylon: Number One authorises the Basestar.
++     * Both trees are the same shape - a root menu, a grant-or-refuse line, then a confirm - which
++     * is why one state machine drives both from a small table. */
++    private static final String ADAMA = "%$bgo.npc_adama.Phrase__";
++    private static final String NO1 = "%$bgo.npc_no1.Phrase__";
++    // greeting, "get assignments", "request the flagship", "nothing right now"
++    private static final String[] COL_ROOT = {
++            ADAMA + "5d4a7e64-abb7-4093-9fd4-149ee54b1237__0%",
++            ADAMA + "35a28c51-21f0-4ade-b97e-c01f6d85cbce__0%",
++            ADAMA + "35a28c51-21f0-4ade-b97e-c01f6d85cbce__1%",
++            ADAMA + "35a28c51-21f0-4ade-b97e-c01f6d85cbce__3%",
++    };
++    private static final String[] CYL_ROOT = {
++            NO1 + "e4896283-ffab-4f79-855e-62375d3c7381__0%",
++            NO1 + "03500444-5ae8-473f-a6e8-c8cc14a6ec37__0%",
++            NO1 + "03500444-5ae8-473f-a6e8-c8cc14a6ec37__1%",
++            NO1 + "03500444-5ae8-473f-a6e8-c8cc14a6ec37__3%",
++    };
++    // the officer's answer to the request, then confirm / cancel / cannot-afford
++    private static final String[] COL_RENT = {
++            ADAMA + "cc0d3112-1e80-4db8-b9f8-74efa760fa6d__2%",
++            ADAMA + "a5d4cc23-3544-4cfc-bf2d-fdb45dcddf8b__0%",
++            ADAMA + "a5d4cc23-3544-4cfc-bf2d-fdb45dcddf8b__1%",
++            ADAMA + "ac043882-f184-4036-a8f4-2a0abc98d4db__0%",
++    };
++    private static final String[] CYL_RENT = {
++            NO1 + "17772a8a-7a05-44c4-aad5-70f5178f7c35__2%",
++            NO1 + "ea96bd28-35c9-4f72-8da6-119651e68906__0%",
++            NO1 + "ea96bd28-35c9-4f72-8da6-119651e68906__1%",
++            NO1 + "7cad2019-637f-4880-b0ed-8fb629c7890d__0%",
++    };
++    /* Everyone else keeps the assignments-only menu the room dialogue had before. The phrase is
++     * Number Two's, but it is faction-neutral text ("Request objectives update.") and the client
++     * renders whatever we hand it under the NPC's own name. */
++    private static final String GENERIC_GREETING = "%$bgo.npc_no8.Phrase__2382939f-71b5-4822-8549-a64bd9f47a6d__0%";
++    private static final String GENERIC_ASSIGNMENTS = "%$bgo.npc_no2.Phrase__04a77746-d78a-4e4e-98bf-68f988d63b0e__0%";
++
++    /* Which figure in the room may authorise a flagship. In the original the Pegasus was Adama's
++     * to give and the Basestar was Cavil's, so the outpost quartermasters deliberately do not
++     * offer it - the trip to the home CIC is the point. */
++    private static final String COLONIAL_CAPITAL_NPC = "Adama";
++    private static final String CYLON_CAPITAL_NPC = "No1";
++
++    /* Water for cubits, on exactly the four the original used (research/bsgo_wiki/Water.txt:8-17):
++     * Starbuck aboard the Galactica and any outpost Quartermaster for the Colonials, Number Six
++     * aboard the Basestar and any outpost Number Eight for the Cylons. Mining is the only source
++     * of water and this is the only sink, so it is also the only cubit faucet a pilot controls.
++     * One phrase set per faction rather than per NPC: the text is written for a quartermaster
++     * ("the fleet stores" / "Basestar reserves") and reads correctly under any of the four, and
++     * the client renders it beneath whichever NPC is speaking. */
++    private static final Set<String> WATER_NPCS = Set.of("Starbuck", "Officer", "No6", "Sharon");
++    private static final String HOUTP = "%$bgo.npc_humanoutpost.Phrase__";
++    private static final String COUTP = "%$bgo.npc_no8outpost.Phrase__";
++    // offer, status, confirm, decline, receipt
++    private static final String[] COL_WATER = {
++            HOUTP + "03a56dc5-4957-4edc-a10c-b6c0523f0812__2%",
++            HOUTP + "e8a0b80c-519a-49d9-9e13-2092811c9962__0%",
++            HOUTP + "d0ce0e14-9911-4829-8337-5d16b8b7ca38__0%",
++            HOUTP + "d0ce0e14-9911-4829-8337-5d16b8b7ca38__1%",
++            HOUTP + "4397dd12-e774-4c64-87c1-e8948e9de08f__0%",
++    };
++    private static final String[] CYL_WATER = {
++            COUTP + "35611029-6746-4055-ab2e-5790355e4833__2%",
++            COUTP + "f3344f17-0f77-4c81-95ea-7ecf47f9602c__0%",
++            COUTP + "63ea0e17-65b0-4a60-b8de-bf042c9ca655__0%",
++            COUTP + "63ea0e17-65b0-4a60-b8de-bf042c9ca655__1%",
++            COUTP + "6e7d86ec-a2c3-4b9a-8f60-b531149feb50__0%",
++    };
++    /* 5 water buys 1 cubit, the original's rate (research/bsgo_wiki/Water.txt:6).
++     * The original also capped the exchange at 280,000 water a week (:18) - a throttle on the
++     * live game's only cubit faucet, aimed at an economy with a cash shop behind it. This is a
++     * private server with neither, so the cap is deliberately NOT implemented: mine as much ice
++     * as you like. Keeping it uncapped also keeps the exchange stateless, which matters more than
++     * it sounds - a weekly ledger would need a persisted counter, and counters are dropped at
++     * load unless a Counter card backs the guid (Counters.injectOldCounters), the same trap that
++     * made the first capital rental evaporate on every relog. */
++    public static final int WATER_PER_CUBIT = 5;
++
++    private static final byte SAY_ASSIGNMENTS = 1;
++    private static final byte SAY_REQUEST_CAPITAL = 2;
++    private static final byte SAY_LEAVE = 3;
++    private static final byte SAY_CONFIRM_CAPITAL = 4;
++    private static final byte SAY_WATER = 5;
++    private static final byte SAY_CONFIRM_WATER = 6;
++    private static final byte SAY_REQUEST_FLAGSHIP = 7;
++
++    /* The flagship request has no line of its own: the original never let anyone fly the
++     * Galactica or the Guardian, so no phrase for them was ever written. The ship NAME does
++     * exist, and the client resolves %$bgo.<key>.Name% tokens anywhere inside a phrase (the
++     * shipped lines interpolate %Rank% and %CapShipCost% the same way), so the menu entry is
++     * built around the client's own name for the hull rather than a string we invented. */
++    private static final String COL_FLAGSHIP_REQUEST =
++            "Requesting temporary command of the %$bgo.cruiser_galactica.Name%, sir. [Command Battlestar]";
++    private static final String CYL_FLAGSHIP_REQUEST =
++            "Request %$bgo.ship_basestar_guardian.Name% command access [Command Basestar]";
++
++    /** Which capital the pilot asked for, so the confirmation rents the one they chose. */
++    private long pendingCapital;
++
++    private enum Stage { ROOT, CONFIRM_CAPITAL, CONFIRM_WATER }
++
++    private long pendingWater;
++    private long pendingCubits;
++
+     private MissionDistributor missionDistributor;
++    /** The room NPC this dialogue is with; RoomProtocol sets it when the talk request lands. */
++    private String currentNpc = "";
++    private Stage stage = Stage.ROOT;
++
+     public DialogProtocol(ProtocolContext ctx)
+     {
+         super(ProtocolID.Dialog, ctx);
+@@ -32,6 +159,42 @@ public class DialogProtocol extends BgoProtocol
+         this.missionDistributor = new MissionDistributor(user().getPlayer(), ctx.galaxy(), ctx.rng());
+     }
+ 
++    /** Called by RoomProtocol when the player clicks an NPC, before the greeting goes out. */
++    public void beginDialog(final String npc)
++    {
++        this.currentNpc = npc == null ? "" : npc;
++        this.stage = Stage.ROOT;
++    }
++
++    private boolean isColonial()
++    {
++        return user().getPlayer().getFaction() == Faction.Colonial;
++    }
++
++    /** True when the NPC in front of the player is the one who authorises their faction's capital. */
++    private boolean npcGrantsCapital()
++    {
++        return currentNpc.equals(isColonial() ? COLONIAL_CAPITAL_NPC : CYLON_CAPITAL_NPC);
++    }
++
++    private long capitalPrice()
++    {
++        return CapitalRental.priceFor(user().getPlayer().getFaction(), CDI.current().select(Galaxy.class).get());
++    }
++
++    private boolean canAffordCapital()
++    {
++        return ContainerVisitor.isEnoughInContainer(
++                new Price(ResourceType.Token, capitalPrice()), user().getPlayer().getHold(), 1);
++    }
++
++    public String greetingFor(final String npc)
++    {
++        if (npc.equals(COLONIAL_CAPITAL_NPC)) return COL_ROOT[0];
++        if (npc.equals(CYLON_CAPITAL_NPC)) return CYL_ROOT[0];
++        return GENERIC_GREETING;
++    }
++
+     @Override
+     public void parseMessage(final int msgType, final BgoProtocolReader br) throws IOException
+     {
+@@ -44,30 +207,127 @@ public class DialogProtocol extends BgoProtocol
+             case Say ->
+             {
+                 final byte index = br.readByte();
+-                log.warn(user().getUserLog() + "Dialog say " + index);
+-                if (index != 1)
++                log.debug(user().getUserLog() + "Dialog say " + index);
++                switch (index)
+                 {
+-                    log.warn(user().getUserLog() + "Wrong index given " + index);
+-                    return;
+-                }
+-                final Player player = user().getPlayer();
+-                //doesn't matter, just by default get assignments
+-                user().send(writeStopped());
+-
+-                final boolean updated = missionDistributor.updateMissionBook();
+-                log.debug("User updated missions ? {} {}", updated, player.getCounterFacade().missionBook());
+-                if (updated)
+-                {
+-                    PlayerProtocolWriteOnly playerProtocolWriteOnly = ProtocolRegistryWriteOnly.getProtocol(ProtocolID.Player);
+-                    user().send(playerProtocolWriteOnly.writeMissions(player.getCounterFacade().missionBook()));
++                    case SAY_ASSIGNMENTS -> { sendAssignments(); user().send(writeStopped()); }
++                    /* The request. The officer answers with the grant line either way - the
++                     * refusal in the original data is about the ship being deployed elsewhere,
++                     * which cannot happen here - and the affordable case gets the confirm pair
++                     * while the broke case gets a single acknowledgement. Nothing is charged
++                     * until the confirmation comes back. */
++                    case SAY_REQUEST_CAPITAL ->
++                    {
++                        if (!npcGrantsCapital())
++                        {
++                            log.warn(user().getUserLog() + "capital request to " + currentNpc + ", who cannot grant it");
++                            user().send(writeStopped());
++                            return;
++                        }
++                        pendingCapital = CapitalRental.forFaction(user().getPlayer().getFaction(), false);
++                        stage = Stage.CONFIRM_CAPITAL;
++                        user().send(writeNpcRemark(new Remark((byte) 1, (isColonial() ? COL_RENT : CYL_RENT)[0], "")));
++                    }
++                    case SAY_REQUEST_FLAGSHIP ->
++                    {
++                        if (!npcGrantsCapital())
++                        {
++                            user().send(writeStopped());
++                            return;
++                        }
++                        pendingCapital = CapitalRental.forFaction(user().getPlayer().getFaction(), true);
++                        stage = Stage.CONFIRM_CAPITAL;
++                        user().send(writeNpcRemark(new Remark((byte) 1, (isColonial() ? COL_RENT : CYL_RENT)[0], "")));
++                    }
++                    case SAY_CONFIRM_CAPITAL ->
++                    {
++                        final Player player = user().getPlayer();
++                        final PlayerProtocol playerProtocol = user().getProtocol(ProtocolID.Player);
++                        final long capitalGuid = pendingCapital != 0 ? pendingCapital
++                                : CapitalRental.forFaction(player.getFaction(), false);
++                        CDI.current().select(Catalogue.class).get()
++                                .fetchCard(capitalGuid, CardView.Ship)
++                                .ifPresent(card -> playerProtocol.rentCapital((ShipCard) card));
++                        log.info("{} confirmed capital rental of {} at {} tokens",
++                                user().getUserLog(), capitalGuid, capitalPrice());
++                        stage = Stage.ROOT;
++                        user().send(writeStopped());
++                    }
++                    /* Quote the trade before charging for it. The four numbers go out as
++                     * WaterExchangeValues, which is where the client's %WaterAmountExchange% and
++                     * friends come from - the phrases below are written around those
++                     * placeholders, so the officer states the exact amounts. */
++                    case SAY_WATER ->
++                    {
++                        if (!WATER_NPCS.contains(currentNpc))
++                        {
++                            user().send(writeStopped());
++                            return;
++                        }
++                        quoteWaterExchange();
++                        stage = Stage.CONFIRM_WATER;
++                        user().send(writeNpcRemark(new Remark((byte) 1, (isColonial() ? COL_WATER : CYL_WATER)[1], "")));
++                    }
++                    case SAY_CONFIRM_WATER ->
++                    {
++                        applyWaterExchange();
++                        stage = Stage.ROOT;
++                        user().send(writeNpcRemark(new Remark((byte) 1, (isColonial() ? COL_WATER : CYL_WATER)[4], "")));
++                        user().send(writeStopped());
++                    }
++                    case SAY_LEAVE -> { stage = Stage.ROOT; user().send(writeStopped()); }
++                    default ->
++                    {
++                        log.warn(user().getUserLog() + "Wrong index given " + index);
++                        user().send(writeStopped());
++                    }
+                 }
+             }
++            /* The client asks for the answer list once the NPC's line has been read, so this is
++             * where the menu is built - and it is rebuilt per advance, which is what lets the
++             * confirm step replace the root menu rather than append to it. */
+             case Advance ->
+             {
+-                log.warn(user().getUserLog() + "Advance daylies");
+-                Remark remark1 = new Remark((byte) 1, "%$bgo.npc_no2.Phrase__04a77746-d78a-4e4e-98bf-68f988d63b0e__0%", "");
+-
+-                final List<Remark> remarks = List.of(remark1);
++                final List<Remark> remarks = new ArrayList<>();
++                if (stage == Stage.CONFIRM_WATER)
++                {
++                    final String[] w = isColonial() ? COL_WATER : CYL_WATER;
++                    if (pendingWater > 0) remarks.add(new Remark(SAY_CONFIRM_WATER, w[2], ""));
++                    remarks.add(new Remark(SAY_LEAVE, w[3], ""));
++                }
++                else if (stage == Stage.CONFIRM_CAPITAL)
++                {
++                    final String[] rent = isColonial() ? COL_RENT : CYL_RENT;
++                    if (canAffordCapital())
++                    {
++                        remarks.add(new Remark(SAY_CONFIRM_CAPITAL, rent[1], ""));
++                        remarks.add(new Remark(SAY_LEAVE, rent[2], ""));
++                    }
++                    else
++                    {
++                        remarks.add(new Remark(SAY_LEAVE, rent[3], ""));
++                    }
++                }
++                else
++                {
++                    final String[] root = isColonial() ? COL_ROOT : CYL_ROOT;
++                    final boolean capitalNpc = npcGrantsCapital();
++                    remarks.add(new Remark(SAY_ASSIGNMENTS, capitalNpc ? root[1] : GENERIC_ASSIGNMENTS, ""));
++                    if (capitalNpc)
++                    {
++                        remarks.add(new Remark(SAY_REQUEST_CAPITAL, root[2], ""));
++                        remarks.add(new Remark(SAY_REQUEST_FLAGSHIP,
++                                isColonial() ? COL_FLAGSHIP_REQUEST : CYL_FLAGSHIP_REQUEST, ""));
++                    }
++                    if (WATER_NPCS.contains(currentNpc))
++                    {
++                        remarks.add(new Remark(SAY_WATER, (isColonial() ? COL_WATER : CYL_WATER)[0], ""));
++                    }
++                    if (capitalNpc || WATER_NPCS.contains(currentNpc))
++                    {
++                        remarks.add(new Remark(SAY_LEAVE, root[3], ""));
++                    }
++                }
+                 user().send(writePcRemarks(remarks));
+             }
+             case Stop ->
+@@ -81,6 +341,57 @@ public class DialogProtocol extends BgoProtocol
+             }
+         }
+     }
++    private long waterInHold()
++    {
++        return user().getPlayer().getHold().getByGUID(ResourceType.Water.guid)
++                .filter(i -> i instanceof ItemCountable)
++                .map(i -> ((ItemCountable) i).getCount()).orElse(0L);
++    }
++
++    /** Work out what the pilot may trade right now and tell the client, so the phrases can
++     *  quote it. Deliberately quotes the WHOLE hold - the original exchanged everything in one
++     *  transaction rather than metering it out. */
++    private void quoteWaterExchange()
++    {
++        final long inHold = waterInHold();
++        // Only whole cubits are paid, so never take the remainder the pilot would not be paid for.
++        pendingWater = (inHold / WATER_PER_CUBIT) * WATER_PER_CUBIT;
++        pendingCubits = pendingWater / WATER_PER_CUBIT;
++        user().send(ProtocolRegistryWriteOnly.<PlayerProtocolWriteOnly>getProtocol(ProtocolID.Player)
++                .writeWaterExchangeValues(pendingWater, inHold, pendingWater, pendingCubits, WATER_PER_CUBIT));
++    }
++
++    private void applyWaterExchange()
++    {
++        if (pendingWater <= 0)
++            return;
++        // Re-read the hold: the quote was taken before the player confirmed, and mining or a
++        // hold transfer in between must not let the trade pay out more than is actually there.
++        final long water = Math.min(pendingWater, (waterInHold() / WATER_PER_CUBIT) * WATER_PER_CUBIT);
++        if (water <= 0)
++            return;
++        final long cubits = water / WATER_PER_CUBIT;
++        final Player player = user().getPlayer();
++        final ContainerVisitor visitor = new ShopVisitor(user(), null, ctx.rng());
++        visitor.removeBuyResources(new Price(ResourceType.Water, water), player.getHold(), 1);
++        visitor.addShipItem(ItemCountable.fromGUID(ResourceType.Cubits.guid, cubits), player.getHold());
++        pendingWater = 0;
++        pendingCubits = 0;
++        log.info("{} exchanged {} water for {} cubits", user().getUserLog(), water, cubits);
++    }
++
++    private void sendAssignments()
++    {
++        final Player player = user().getPlayer();
++        final boolean updated = missionDistributor.updateMissionBook();
++        log.debug("User updated missions ? {} {}", updated, player.getCounterFacade().missionBook());
++        if (updated)
++        {
++            PlayerProtocolWriteOnly playerProtocolWriteOnly = ProtocolRegistryWriteOnly.getProtocol(ProtocolID.Player);
++            user().send(playerProtocolWriteOnly.writeMissions(player.getCounterFacade().missionBook()));
++        }
++    }
++
+     public BgoProtocolWriter writeStopped()
+     {
+         final BgoProtocolWriter bw = newMessage();
+diff --git a/src/main/java/io/github/luigeneric/core/protocols/player/CapitalRental.java b/src/main/java/io/github/luigeneric/core/protocols/player/CapitalRental.java
+new file mode 100644
+index 0000000..3458ba1
+--- /dev/null
++++ b/src/main/java/io/github/luigeneric/core/protocols/player/CapitalRental.java
+@@ -0,0 +1,169 @@
++package io.github.luigeneric.core.protocols.player;
++
++import io.github.luigeneric.core.galaxy.Galaxy;
++import io.github.luigeneric.core.player.HangarShip;
++import io.github.luigeneric.core.player.container.ShipSlot;
++import io.github.luigeneric.core.player.container.ShipSlots;
++import io.github.luigeneric.enums.Faction;
++import io.github.luigeneric.templates.cards.ShipSlotCard;
++import io.github.luigeneric.templates.shipitems.ShipSystem;
++import io.github.luigeneric.templates.utils.ShipSlotType;
++
++/**
++ * The Pegasus and Basestar are rented, never owned: 20,000 tokens buys one hour, cheaper the
++ * less of the map your faction holds, cheapest when the enemy holds most of it and you don't.
++ * The underdog flying a battlestar is the fun case, so the discount points that way.
++ *
++ * Expiry rides in the player's counters keyed by the ship card guid - no schema change, and it
++ * persists like any other counter. Enforcement is live: CapitalRentalExpiry sweeps connected
++ * players, docks whoever is still flying one back to their home CIC and hands the hull back with
++ * ServerMessage.RemoveShip. The hangar load in SqLiteProvider stays as the offline backstop for
++ * rentals that ran out while the player was away.
++ *
++ * Counters.injectOldCounters drops a counter whose guid has no Counter card, so the expiry only
++ * survives a relog because CounterCardType carries capital_rental_* entries at these same guids
++ * and cards.js emits a Counter card per entry. CapitalRentalRegistry remains the live in-memory
++ * authority; the counter is what makes the clock outlive a restart.
++ */
++public final class CapitalRental
++{
++    public static final long PEGASUS = 5017L;
++    public static final long BASESTAR = 5117L;
++    /* The fleet flagships - a step above the Pegasus/Basestar pair and, unlike them, never
++     * flyable in the original. They rent exactly the same way; isRental below is what keeps them
++     * off the purchase path, since a rental hull ships with an empty BuyPrice. */
++    public static final long GALACTICA = 5019L;
++    public static final long GUARDIAN = 5119L;
++
++    /** The hourly capital for a faction: index 0 is the Pegasus tier, index 1 the flagship. */
++    public static long forFaction(final Faction faction, final boolean flagship)
++    {
++        if (faction == Faction.Colonial)
++            return flagship ? GALACTICA : PEGASUS;
++        return flagship ? GUARDIAN : BASESTAR;
++    }
++    /** Shop items-tab passes; buying one starts the rental instead of delivering an item. */
++    public static final long PASS_PEGASUS = 5020L;
++    public static final long PASS_BASESTAR = 5120L;
++    /* A rented hull MUST sit at serverID == its card's HangarID. That is not a convention, it is
++     * how the client finds it: ShipCard.GetHangarShip scans the hangar for
++     * "HangarID == ship.ServerID", and the hangar window lights a flagship's variant button only
++     * when Game.Me.Hangar[variantHangarID] resolves. An offset slot is a ship the client can
++     * never see or command - which is what a paid-for Pegasus was, parked at slot 47 while every
++     * lookup asked for 18. The collision this offset existed to dodge is gone now that the
++     * capitals hold a HangarID of their own instead of sharing 17 with the stealth hulls. */
++    public static final int SERVER_ID_OFFSET = 0;
++    public static final long BASE_PRICE = 20_000L;
++    public static final long FLOOR_PRICE = 2_000L;
++    public static final long DURATION_SECONDS = 3600L;
++    /* The hangar slot the pilot flew before the rental, so expiry can put them back in it.
++     * CounterCardType.capital_rental_return_slot carries the same 234; change either only
++     * together with the other. Kept literal because javac inlines static final primitives and
++     * this file is meant to be the only use site. */
++    public static final long RETURN_SLOT_COUNTER = 234L;
++
++    private CapitalRental()
++    {
++    }
++
++    public static boolean isRental(final long shipGuid)
++    {
++        return shipGuid == PEGASUS || shipGuid == BASESTAR
++                || shipGuid == GALACTICA || shipGuid == GUARDIAN;
++    }
++
++    public static boolean isPass(final long itemGuid)
++    {
++        return itemGuid == PASS_PEGASUS || itemGuid == PASS_BASESTAR;
++    }
++
++    public static long capitalForPass(final long passGuid)
++    {
++        return passGuid == PASS_PEGASUS ? PEGASUS : BASESTAR;
++    }
++
++    /* The stock loadout. A rental is an hour of a battlestar, not an hour of a hull the pilot then
++     * has to find 720k tylium of tier-4 hardware for, so it arrives armed. These four are the only
++     * tier-4 systems whose SlotType matches a capital bay; all are Neutral, so the same three arm
++     * both factions and the Colonial/Cylon pair stays identical without a second table.
++     * Private on purpose: javac inlines static final primitives at the use site, and keeping the
++     * only use sites in this file means changing a guid can never need a clean build. */
++    private static final long CAPSHIP_CANNON = 6031L;
++    private static final long CAPSHIP_POINT_DEFENCE = 6032L;
++    private static final long CAPSHIP_LAUNCHER = 6034L;
++
++    /** 0 for a bay that gets nothing - the flagships' paint slot, and anything added later. */
++    private static long systemForSlot(final ShipSlotType slotType)
++    {
++        return switch (slotType)
++        {
++            case gun -> CAPSHIP_CANNON;
++            case launcher -> CAPSHIP_LAUNCHER;
++            /* Flak (6033) is deliberately left on the shelf: it is the paid alternative to point
++             * defence and is the only reason the two defensive bays are a choice at all. */
++            case defensive_weapon -> CAPSHIP_POINT_DEFENCE;
++            default -> 0L;
++        };
++    }
++
++    /**
++     * Fills a rented capital's empty weapon bays. The HangarShip constructor has already built one
++     * empty ShipSlot per ShipSlotCard, so the slots are fetched and filled rather than added - that
++     * keeps the ShipSlots map keyed by slotId, which is what the client and ShipBindings both index
++     * by. ShipSlot.addShipItem preserves the slot's serverID and builds the ShipAbility from the
++     * system's first ability card; without that ability the bay fires nothing and gets no turret.
++     *
++     * No consumable is seeded. All four capital ability cards (71002031-34) carry
++     * ConsumableOption NotUsing, so AbilityAction.checkConsumablesSatisfied short-circuits before
++     * it ever reads the Hold and FireMissileAction falls back to the built-in round. Seeding one
++     * would only make the client draw an ammo counter for rounds nothing spends.
++     *
++     * Arming the HangarShip arms the ship in space too: SpaceObjectFactory.createPlayerShip hands
++     * the active HangarShip's SpaceSubscribeInfo straight to the PlayerShip, and that instance
++     * holds this same ShipSlots object.
++     *
++     * Idempotent - an already-fitted bay is left alone, so this is safe to re-run on a hull whose
++     * loadout came back from the database.
++     */
++    public static void arm(final HangarShip hangarShip)
++    {
++        if (!isRental(hangarShip.getCardGuid()))
++            return;
++
++        final ShipSlots slots = hangarShip.getShipSlots();
++        for (final ShipSlotCard slotCard : hangarShip.getShipCard().getShipSlotCards())
++        {
++            final long systemGuid = systemForSlot(slotCard.getShipSlotType());
++            if (systemGuid == 0)
++                continue;
++
++            // null when the hull's level is below the slot card's - not the case for the capitals,
++            // but HangarShip drops such slots and getSlot is the only honest way to find out.
++            final ShipSlot slot = slots.getSlot(slotCard.getSlotId());
++            if (slot == null)
++                continue;
++
++            final ShipSystem fitted = slot.getShipSystem();
++            if (fitted != null && fitted.getShipSystemCard() != null)
++                continue;
++
++            slot.addShipItem(ShipSystem.fromGUID(systemGuid));
++        }
++        // Slot systems can carry StaticBuffs/MultiplyBuffs; re-run before max HP/PP are read.
++        hangarShip.getShipStats().applyStats();
++    }
++
++    public static long priceFor(final Faction faction, final Galaxy galaxy)
++    {
++        final int[] counts = galaxy.countOutposts();
++        final float own = faction == Faction.Colonial ? counts[0] : counts[1];
++        final float enemy = faction == Faction.Colonial ? counts[1] : counts[0];
++        final float capable = counts[2];
++        float price = BASE_PRICE * (0.2f + 0.8f * (own / capable));
++        if (enemy / capable > 0.5f && own < enemy)
++        {
++            price *= 0.5f;
++        }
++        return Math.max(FLOOR_PRICE, Math.round(price));
++    }
++}
+diff --git a/src/main/java/io/github/luigeneric/templates/cards/CounterCardType.java b/src/main/java/io/github/luigeneric/templates/cards/CounterCardType.java
+index 969d8e4..80b1151 100644
+--- a/src/main/java/io/github/luigeneric/templates/cards/CounterCardType.java
++++ b/src/main/java/io/github/luigeneric/templates/cards/CounterCardType.java
+@@ -106,7 +106,24 @@ public enum CounterCardType
+     outposts_damage_dealt(232),
+     outposts_damage_received(233),
+ 
+-    drones_killed(260734533);
++    drones_killed(260734533),
++
++    /* Capital rental expiry, keyed by the rented hull's OWN ship guid - that is the whole
++     * persistence scheme (see CapitalRental), so these guids are the ship guids and must never
++     * drift from them. Counters.injectOldCounters refuses any guid without a Counter card and
++     * addCounterOf only touches pre-seeded guids, so before these entries existed the expiry
++     * write landed nowhere and SqLiteProvider's login sweep read the missing counter as 0 -
++     * i.e. every rental was deleted as expired on the first relog, with time still on the
++     * clock. cards.js emits one Counter card per entry in this enum, so listing them here IS
++     * what emits the cards. */
++    capital_rental_pegasus(5017),
++    capital_rental_basestar(5117),
++    capital_rental_galactica(5019),
++    capital_rental_guardian(5119),
++    /* The hangar slot the pilot flew before renting, so expiry can put them back in it.
++     * CapitalRental.RETURN_SLOT_COUNTER carries the same 234 and its comment names this
++     * constant; change either only together with the other. */
++    capital_rental_return_slot(234);
+ 
+ 
+     public final long cardGuid;
